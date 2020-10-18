@@ -2,3 +2,8 @@ black==20.8b1
 flake8==3.8.4
 tqdm==4.50.2
 lxml==4.6.1
+
+fire
+beautifulsoup4
+pydocx
+pdfminer3
