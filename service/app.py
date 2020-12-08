@@ -3,39 +3,39 @@ import pickle
 import json
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
+import zipfile
+import tempfile
+import shutil
+from pathlib import Path
+import re
+import pke
+import spacy
+from dataclasses import dataclass
+
+import sys
+sys.path.append('..')
+
+from src.pdf_parser import Parser
+
+import pickle
+
+@dataclass
+class ProfStandard:
+    name: str
+    rank: int
+    rpds: dict
+
+class CustomUnpickler(pickle.Unpickler):
+
+    def find_class(self, module, name):
+        return super().find_class(module, 'ProfStandard')
+
 
 RPD_EMBEDDINGS_PATH = "../data/processed/tbd_embeddings.pkl"
 PROF_EMBEDDINGS_PATH = "../data/processed/prof_embeddings.pkl"
 RPD_KEYWORDS = "../data/processed/tbd_keywords.json"
 PROF_KEYWORDS = "../data/processed/prof_keywords.json"
-
-
-@st.cache(allow_output_mutation=True)
-def load_rpd_embeddings():
-    with open(RPD_EMBEDDINGS_PATH, "rb") as f:
-        rpd_embeddings = pickle.load(f)
-    return rpd_embeddings
-
-
-@st.cache(allow_output_mutation=True)
-def load_prof_embeddings():
-    with open(PROF_EMBEDDINGS_PATH, "rb") as f:
-        prof_embeddings = pickle.load(f)
-    return prof_embeddings
-
-
-@st.cache(allow_output_mutation=True)
-def load_rpd_keywords():
-    with open(RPD_KEYWORDS) as f:
-        rpd_embeddings = json.load(f)
-    return rpd_embeddings
-
-
-@st.cache(allow_output_mutation=True)
-def load_prof_keywords():
-    with open(PROF_KEYWORDS) as f:
-        rpd_embeddings = json.load(f)
-    return rpd_embeddings
+SORTED_PROF_RANKS = "../data/sorted_prof_ranks.pkl"
 
 
 def compute_similarity(rpd_embeddings, prof_embeddings, top_n):
@@ -61,40 +61,112 @@ def argsort(x, top_n=None, reverse=False):
     return most_extreme.take(np.argsort(x.take(most_extreme)))
 
 
+@st.cache(allow_output_mutation=True)
+def parse_zip(zip_file):
+    with zipfile.ZipFile(zip_file) as zip_archive:
+        temp_dir = Path(tempfile.mkdtemp())
+        zip_archive.extractall(temp_dir)
+        parser = Parser()
+        docs = {}
+        unzip_folder_name = zip_file.name.rsplit('.', 1)[0]
+        for file_path in temp_dir.joinpath(unzip_folder_name).iterdir():
+            if file_path.suffix in [".docx", '.pdf']:
+                text = parser.parse(file_path, ext=file_path.suffix[1:])
+                parts = []
+                part1_span = re.search(r'1\.1\.?', text)
+                part2_span = re.search(r'1\.2\.?', text)
+                part3_span = re.search(r'1\.3\.?', text)
+                part4_span = re.search(r'1\.4\.?', text)
+                if not (part1_span and part2_span and part3_span and part4_span):
+                    continue
+                parts.append(text[part1_span.end():part2_span.start()])
+                parts.append(text[part3_span.end():part4_span.start()])
+
+                docs[file_path.stem] = '\n'.join(parts)
+
+        shutil.rmtree(temp_dir)
+
+    return docs
+
+
+@st.cache(allow_output_mutation=True)
+def get_keywords(docs):
+    model = spacy.load("../ru2/")
+
+    rpd_keywords = {}
+
+    for x in docs:
+        extractor = pke.unsupervised.SingleRank()
+        extractor.load_document(input=docs[x], spacy_model=model)
+        extractor.candidate_selection()
+        extractor.candidate_weighting()
+        keyphrases = extractor.get_n_best(n=30)
+        rpd_keywords[x] = keyphrases
+    return rpd_keywords
+
+
+@st.cache(allow_output_mutation=True)
+def load_prof_embeddings():
+    with open(PROF_EMBEDDINGS_PATH, "rb") as f:
+        prof_embeddings = pickle.load(f)
+    return prof_embeddings
+
+@st.cache(allow_output_mutation=True)
+def load_prof_ranks():
+    return CustomUnpickler(open(SORTED_PROF_RANKS, 'rb')).load()
+
+
 def main():
-    rpd_embeddings = load_rpd_embeddings()
+    # rpd_embeddings = load_rpd_embeddings()
     prof_embeddings = load_prof_embeddings()
 
-    rpd_keywords = load_rpd_keywords()
-    prof_keywords = load_prof_keywords()
+    # rpd_keywords = load_rpd_keywords()
+    # prof_keywords = load_prof_keywords()
 
-    st.sidebar.title("Compute similarity")
-    top_n = st.sidebar.number_input("TOP-N", value=10)
-    find_button = st.sidebar.button("Find")
+    st.sidebar.title("Пакет документов для образовательной программы")
+    zip_file = st.sidebar.file_uploader('', type='zip')
+    # upload_button = st.sidebar.button("Загрузить")
 
-    st.sidebar.title("Keywords")
-    selected_rpd = st.sidebar.selectbox("RPD", list(rpd_embeddings.keys()))
-    rpd_keywords_button = st.sidebar.button("Display", key="rpd")
+    # rpd_keywords = {}
+    # if zip_file and upload_button:
+    #     docs = parse_zip(zip_file)
+    #     rpd_keywords = get_keywords(docs)
 
-    selected_prof_standard = st.sidebar.selectbox(
-        "Prof standard", list(prof_embeddings.keys())
-    )
-    prof_keywords_button = st.sidebar.button("Display", key="prof")
+    st.sidebar.title("Профстандарты")
+    top_n = st.sidebar.number_input("TOP-N", min_value=1, value=20)
+    display_keywords = st.sidebar.checkbox('Display keywords')
+    find_button = st.sidebar.button("Найти")
+    if zip_file and find_button:
+        docs = parse_zip(zip_file)
+        rpd_keywords = get_keywords(docs)
+        prof_ranks = load_prof_ranks()
 
-    if find_button:
-        st.title("RPD to prof. standard matching")
-        result = compute_similarity(rpd_embeddings, prof_embeddings, top_n)
-        st.write(result)
+        rows = []
+        for i, prof_standard in enumerate(prof_ranks[:top_n]):
+            keywords = set()
+            for values in prof_standard.rpds.values():
+                keywords.update(list(values))
+            row = f"| {i} | `{prof_standard.name}` | {prof_standard.rank} |"
+            rows.append(row)
 
-    if rpd_keywords_button:
-        st.title("Keywords")
-        st.header(f"RPD: {selected_rpd}")
-        st.write(rpd_keywords[selected_rpd])
+        table_rows = "\n".join(rows)
+        table = f"""
+        |  | Профстандарт | Score |
+        | --- | ---: | ---: |
+        {table_rows}
+        """
+        st.markdown(table)
 
-    if prof_keywords_button:
-        st.title("Keywords")
-        st.header(f"Prof standard: {selected_prof_standard}")
-        st.write(prof_keywords[selected_prof_standard])
+        if display_keywords:
+            st.title('Keywords')
+            keywords = {}
+            for prof_standard in prof_ranks[:top_n]:
+                keywords[prof_standard.name] = set()
+                for kw in prof_standard.rpds.values():
+                    keywords[prof_standard.name].update(list(kw))
+                keywords[prof_standard.name] = list(keywords[prof_standard.name])
+            st.write(keywords)
+
 
 
 if __name__ == "__main__":
